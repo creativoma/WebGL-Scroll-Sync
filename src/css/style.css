@@ -539,8 +539,36 @@ html.no-fix #canvas {
 
 #section02,
 #section03,
-#section04 {
+#section04,
+#section05 {
 	margin-top: var(--margin-top-section);
+}
+
+#section05 {
+	width: 30vw;
+	margin-left: auto;
+	margin-right: auto;
+	text-align: center;
+
+	@media (max-width: 1024px) {
+		width: 100%;
+	}
+}
+
+#section05__title {
+	line-height: var(--line-height-heading);
+	font-size: var(--font-size-h3);
+	text-transform: uppercase;
+}
+
+#section05__description {
+	font-size: var(--font-size-body3);
+	line-height: 1.6;
+	margin-top: 40px;
+
+	code {
+		font-family: monospace;
+	}
 }
 
 #section01,
