@@ -1,6 +1,12 @@
 import * as THREE from 'three';
+import gsap from 'gsap';
+import { ScrollTrigger } from 'gsap/ScrollTrigger';
 import vertexShader from '../shaders/img.vert?raw';
 import fragmentShader from '../shaders/img.frag?raw';
+import introNoiseVertexShader from '../shaders/introNoise.vert?raw';
+import introNoiseFragmentShader from '../shaders/introNoise.frag?raw';
+
+gsap.registerPlugin(ScrollTrigger);
 
 // DOM elements
 const domWrapper = document.getElementById('wrapper');
@@ -11,6 +17,7 @@ let scene;
 let camera;
 let renderer;
 let geometry;
+let introNoiseMesh;
 
 // State variables
 let time = 0;
@@ -21,6 +28,12 @@ let viewportWidth;
 let viewportHeight;
 let prevScrollY = 0;
 let strength = 0;
+
+// Case 1 proxy: a plain object GSAP can tween, added on top of the scroll-driven
+// `strength` above instead of replacing it — both want to drive the same uniform
+// each frame, so they're combined rather than one overwriting the other.
+// Starts at 0 so nothing pulses until its ScrollTrigger fires.
+const introStrengthProxy = { value: 0 };
 
 // Environment variables
 const dpr = window.devicePixelRatio;
@@ -34,6 +47,10 @@ const sharedUniforms = {
 	u_scrollOffset: { value: scrollOffset },
 	u_time: { value: 0 },
 	u_strength: { value: 0 },
+	// Case 1 channel: fed from introStrengthProxy each frame in updateUniforms()
+	u_intro: { value: 0 },
+	// Page background color for the Case 2 curtain wipe; set from the CSS variable in init()
+	u_bgColor: { value: new THREE.Color(0, 0, 0) },
 };
 
 // Items tracking
@@ -44,6 +61,10 @@ const itemList = [];
  */
 function init() {
 	colorBackground = getComputedStyle(document.documentElement).getPropertyValue('--color-background');
+	// Declare the style as linear so three.js skips its sRGB→linear conversion: the raw
+	// ShaderMaterials here write gl_FragColor without the inverse transform, so a converted
+	// value would render far darker than the CSS background (near-black instead of maroon).
+	sharedUniforms.u_bgColor.value.setStyle(colorBackground.trim(), THREE.LinearSRGBColorSpace);
 
 	// Set up Three.js scene
 	setupThreeJS();
@@ -54,12 +75,17 @@ function init() {
 	// Set up event listeners
 	setupEventListeners();
 
+	// Wire up GSAP tweens and ScrollTriggers (see README for the reasoning behind each case)
+	setupGsapAnimations();
+
 	// Initialize state
 	time = performance.now() / 1000;
 	prevScrollY = window.scrollY;
 
-	// Start animation loop
-	animate();
+	// Start animation loop. Using gsap.ticker instead of our own requestAnimationFrame call
+	// means the Three.js render always happens in the same tick as GSAP/ScrollTrigger updates -
+	// two independent rAF loops here would reintroduce the exact one-frame drift this repo exists to avoid.
+	gsap.ticker.add(animate);
 
 	console.log(
 		// credit
@@ -79,6 +105,27 @@ function setupThreeJS() {
 	renderer.setSize(window.innerWidth, window.innerHeight);
 	renderer.setClearColor(colorBackground);
 	geometry = new THREE.PlaneGeometry(1, 1, 1, 1);
+
+	// Case 1 surface: fullscreen noise quad drawn behind the images. At page load
+	// the image meshes are covered or offscreen, so the intro pulse needs a surface
+	// of its own that is guaranteed visible.
+	introNoiseMesh = new THREE.Mesh(
+		new THREE.PlaneGeometry(2, 2, 1, 1),
+		new THREE.ShaderMaterial({
+			uniforms: {
+				u_intro: sharedUniforms.u_intro,
+				u_time: sharedUniforms.u_time,
+				u_bgColor: sharedUniforms.u_bgColor,
+			},
+			vertexShader: introNoiseVertexShader,
+			fragmentShader: introNoiseFragmentShader,
+			depthTest: false,
+			depthWrite: false,
+		}),
+	);
+	introNoiseMesh.renderOrder = -1;
+	introNoiseMesh.frustumCulled = false;
+	scene.add(introNoiseMesh);
 }
 
 /**
@@ -101,8 +148,12 @@ function createImageMeshes() {
 					u_scrollOffset: sharedUniforms.u_scrollOffset,
 					u_time: sharedUniforms.u_time,
 					u_strength: sharedUniforms.u_strength,
+					u_intro: sharedUniforms.u_intro,
+					u_bgColor: sharedUniforms.u_bgColor,
 					u_rands: { value: new THREE.Vector4(0, 0, 0, 0) },
 					u_id: { value: i },
+					// Case 2: driven exclusively by a ScrollTrigger scrub tween, never touched in the rAF loop.
+					u_progress: { value: 0 },
 				},
 				vertexShader,
 				fragmentShader,
@@ -225,11 +276,84 @@ function updateItemPositions() {
 }
 
 /**
+ * Wire up every GSAP case. Wrapped in gsap.matchMedia() so prefers-reduced-motion
+ * users get the end state instantly instead of the animated versions.
+ */
+function setupGsapAnimations() {
+	const mm = gsap.matchMedia();
+
+	mm.add('(prefers-reduced-motion: reduce)', () => {
+		introStrengthProxy.value = 0;
+		itemList.forEach((item) => {
+			item.mesh.material.uniforms.u_progress.value = 1;
+		});
+	});
+
+	mm.add('(prefers-reduced-motion: no-preference)', () => {
+		setupIntroPulse();
+		setupImageRevealOnScroll();
+		setupTextRevealTimeline();
+	});
+}
+
+/**
+ * Case 1 — Proxy tween: GSAP never touches Three.js directly, it tweens a plain
+ * object (`introStrengthProxy`) that the rAF loop reads each frame in updateUniforms().
+ * This is the general pattern for animating anything WebGL-related with GSAP.
+ */
+function setupIntroPulse() {
+	// Fires at page load. The fullscreen noise quad guarantees the pulse is visible
+	// even though every image mesh is covered by its Case 2 wipe (or offscreen) at
+	// that moment; images that ARE partially revealed also get the RGB split.
+	gsap.fromTo(introStrengthProxy, { value: 1 }, { value: 0, duration: 1.4, ease: 'power3.out' });
+}
+
+/**
+ * Case 2 — ScrollTrigger scrub per item: each image's u_progress uniform is tied
+ * to its own scroll range with `scrub: true`, so it reveals in lockstep with the
+ * scrollbar instead of on a fixed-duration timer. No onUpdate/manual reads needed -
+ * GSAP writes item.mesh.material.uniforms.u_progress.value directly every tick.
+ */
+function setupImageRevealOnScroll() {
+	itemList.forEach((item) => {
+		gsap.fromTo(
+			item.mesh.material.uniforms.u_progress,
+			{ value: 0 },
+			{
+				value: 1,
+				ease: 'none',
+				scrollTrigger: {
+					trigger: item.domContainer,
+					start: 'top bottom',
+					end: 'top center',
+					scrub: true,
+				},
+			},
+		);
+	});
+}
+
+/**
+ * Case 3 — Plain DOM timeline with toggleActions instead of scrub: proves the
+ * canvas-based cases above and ordinary DOM animation can share the same page
+ * without any special coordination, since both read from the same scroll position.
+ */
+function setupTextRevealTimeline() {
+	gsap.timeline({
+		scrollTrigger: {
+			trigger: '#section05',
+			start: 'top 80%',
+			toggleActions: 'play none none reverse',
+		},
+	})
+		.from('#section05__title', { autoAlpha: 0, y: 40, duration: 0.8, ease: 'power3.out' })
+		.from('#section05__description', { autoAlpha: 0, y: 20, duration: 0.6, ease: 'power3.out' }, '-=0.4');
+}
+
+/**
  * Animation loop
  */
 function animate() {
-	requestAnimationFrame(animate);
-
 	const scrollY = window.scrollY;
 	const scrollDelta = scrollY - prevScrollY;
 
@@ -272,6 +396,13 @@ function updateStrength(scrollDelta, dt) {
 function updateUniforms(dt, scrollY) {
 	sharedUniforms.u_time.value += dt;
 	sharedUniforms.u_strength.value = Math.min(1, strength);
+	// The intro pulse gets its own uniform rather than being added into u_strength:
+	// scroll alone already saturates u_strength's visual effect, so anything mixed
+	// into it is masked while the user is scrolling - which is exactly when the
+	// pulse's ScrollTrigger fires.
+	sharedUniforms.u_intro.value = introStrengthProxy.value;
+	// skip the fullscreen noise pass entirely once the pulse has settled
+	introNoiseMesh.visible = introStrengthProxy.value > 0.001;
 	scrollOffset.set(window.scrollX, scrollY - viewportHeight * padding);
 }
 
